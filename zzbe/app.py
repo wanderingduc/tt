@@ -1,9 +1,50 @@
 from typing import Union
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import pandas as pd
-from datetime import datetime as dt
+from datetime import datetime as dt, timezone as tz
+from zoneinfo import ZoneInfo
+import mysql.connector
+from mysql.connector import Error
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+host = os.getenv("HOST")
+user = os.getenv("USER")
+password = os.getenv("PASSWORD")
+db = os.getenv("DB")
+
+def after_close():
+    h = dt.now(ZoneInfo("Europe/Oslo")).hour
+    m = dt.now(ZoneInfo("Europe/Oslo")).minute
+
+    if h >= 16 and m >= 30:
+        return True
+    return False
+
+def connect_to_mysql(host, user, password, database):
+    try:
+        # Establish the connection
+        connection = mysql.connector.connect(
+            host=host,
+            user=user,
+            password=password,
+            database=database
+        )
+        
+        if connection.is_connected():
+            print("Successfully connected to the database")
+            return connection
+        else:
+            print("Connection failed")
+            return None
+
+    except Error as e:
+        print(f"Error: {e}")
+        return None
 
 app = FastAPI()
 
@@ -14,21 +55,59 @@ app.add_middleware(
     allow_methods = ['GET']
 )
 
+class Stocks:
+    stocks: list | None = None
+
+@app.get("/health/")
+def health():
+    return {'host':host,'user':user,'password':password,'db':db}
+
 
 @app.get("/")
 def read_root():
     return {"Hello":"World"}
 
-@app.get("/anal/")
-def get_anal():
+@app.get("/anal/old")
+def get_old_anal():
+
+    conn = connect_to_mysql(host, user, password, db)
 
     full = {
         'data': [],
         'meta': {
-            'timestamp': dt.now()
+            'timestamp': dt.now(ZoneInfo("Europe/Oslo"))
+        }
+        # 'db': [host, user, password, db, conn]
+    }
+
+    curr = conn.cursor()
+    query = "SELECT ticker, type, created_at FROM crossovers ORDER BY created_at DESC"
+    curr.execute(query)
+    res = curr.fetchall()
+    for r in res:
+        if not r[1]:
+            continue
+        full['data'].append({'ticker': r[0], 'type': r[1], 'date': r[2]})
+    # full['data'].append({'ticker':'EQNR', 'type':'gold100', 'date': '2025-04-08'})
+    # full['data'].append({'ticker':'EQNR', 'type':'death200', 'date': '2025-04-08'})
+    
+    curr.close()
+    conn.close()
+    return full
+
+@app.get("/anal/")
+def get_anal():
+
+    conn = connect_to_mysql(host, user, password, db)
+
+    full = {
+        'data': [],
+        'meta': {
+            'timestamp': dt.now(ZoneInfo("Europe/Oslo"))
         }
     }
     exchange = 'OL'
+    curr = conn.cursor()
 
     with open('agg.txt', 'r', encoding='UTF-8') as file:
         data = file.read()
@@ -49,8 +128,15 @@ def get_anal():
                 ret = calc_anal(cur, prev, c)
                 if ret['cross']['two'] or ret['cross']['one']:
                     full['data'].append(ret)
+                    if after_close():
+                        query = "INSERT INTO crossovers(ticker, type, created_at) VALUES(%s, %s, NOW())"
+                        values = (ticker, ret['cross']['two'].lower() + '200' if ret['cross']['two'] else ret['cross']['one'].lower() + '100')
+                        curr.execute(query, values)
+                    
 
-
+    conn.commit()
+    curr.close()
+    conn.close()
     return full
 
 def calc_anal(prices, prev_prices, ticker):
